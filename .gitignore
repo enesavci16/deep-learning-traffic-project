@@ -1,0 +1,22 @@
+# Ignore Virtual Environment
+.venv/
+venv/
+env/
+
+# Ignore Python Cache
+__pycache__/
+*.py[cod]
+
+# Ignore Data Files (Too large for GitHub)
+*.h5
+*.pkl
+*.pth
+src/mobility/data/*
+models/*
+
+# Ignore IDE settings
+.vscode/
+.idea/
+
+# Ignore Environment Variables (Security)
+.env
