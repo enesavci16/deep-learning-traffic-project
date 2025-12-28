@@ -44,3 +44,54 @@ We compared a baseline LSTM model against the ST-GCN model. The Graph Neural Net
 Spin up Zookeeper, Kafka, and InfluxDB using Docker Compose:
 ```bash
 docker-compose up -d
+
+
+2. Install Dependencies
+
+# If using uv (recommended)
+uv sync
+
+# Or standard pip
+pip install -r requirements.txt
+
+
+3. Run the Real-Time Pipeline
+Open two terminal windows:
+
+Terminal A: Start the Consumer (The Brain)
+uv run python src/mobility/pipeline/consumer.py
+
+Terminal B: Start the Producer (The Data Source)
+uv run python src/mobility/pipeline/producer.py
+
+. Monitor the Results
+Open your browser to http://localhost:8086.
+
+Login with user: admin / password: password123.
+
+Go to Explore and select the traffic_data bucket.
+
+Filter by measurement traffic_monitor to see the live graph.
+
+📂 Project Structure
+├── docker-compose.yml       # Infrastructure orchestration
+├── src/
+│   ├── mobility/
+│   │   ├── models/          # ST-GCN and LSTM PyTorch definitions
+│   │   ├── pipeline/        # Producer and Consumer scripts
+│   │   ├── preprocessing/   # Adjacency matrix generation
+│   │   └── schemas/         # Data validation (Pydantic)
+├── models/                  # Saved .pth model weights
+└── README.md                # Project documentation
+
+
+🛠️ Technologies Used
+Language: Python
+
+ML Frameworks: PyTorch, PyTorch Geometric
+
+Streaming: Apache Kafka, AIOKafka
+
+Database: InfluxDB (Time Series)
+
+Containerization: Docker
