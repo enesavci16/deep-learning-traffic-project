@@ -1,172 +1,187 @@
 import sys
 import os
-
-# --- PATH FIX ---
-current_dir = os.path.dirname(os.path.abspath(__file__))
-src_dir = os.path.abspath(os.path.join(current_dir, '../../')) 
-sys.path.append(src_dir)
-# ----------------
-
-import logging
-import asyncio
 import json
 import torch
 import numpy as np
-from collections import deque
-from aiokafka import AIOKafkaConsumer
+import logging
+import traceback  # Hataları tam görmek için
+from kafka import KafkaConsumer
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 
-from mobility.models.gnn_lstm import ST_GCN_LSTM
-from mobility.preprocessing import load_adjacency_matrix, MinMaxNormalizer
+print("✅ 1. Kütüphaneler yüklendi.")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+# --- PATH AYARLAMALARI ---
+current_dir = os.path.dirname(os.path.abspath(__file__))
+mobility_dir = os.path.dirname(current_dir)
+src_dir = os.path.dirname(mobility_dir)
+sys.path.append(src_dir)
+
+print(f"✅ 2. Path ayarlandı: {src_dir}")
+
+try:
+    from mobility.models import STGCN_LSTM
+    from mobility.preprocessing import load_traffic_data, MinMaxNormalizer
+    from mobility.utils.graph import load_adj_matrix, calculate_scaled_laplacian
+    print("✅ 3. Proje modülleri (models, preprocessing) yüklendi.")
+except ImportError as e:
+    print(f"❌ MODÜL HATASI: {e}")
+    sys.exit(1)
+
+# LOGGING
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(message)s')
+logger = logging.getLogger("TrafficBrain")
+
+# --- KONFİGÜRASYON ---
+KAFKA_TOPIC = "traffic_sensor_data"
+KAFKA_GROUP = "traffic_predictor_group"
+BOOTSTRAP_SERVERS = ['localhost:9092']
+
+INFLUX_URL = "http://localhost:8086"
+# BURASI ÖNEMLİ: Docker'daki token ile burası aynı olmalı!
+INFLUX_TOKEN = "my-super-secret-auth-token"
+INFLUX_ORG = "my-org"
+INFLUX_BUCKET = "traffic_data"
+
+# Dosya Yolları
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+MODEL_PATH = os.path.join(BASE_DIR, "best_model_stgcn.pth")
+DATA_PATH = os.path.join(src_dir, "mobility", "data", "metr-la.h5")
+ADJ_PATH = os.path.join(src_dir, "mobility", "data", "adj_METR-LA.pkl")
+SEQ_LEN = 12
 
 class TrafficConsumer:
-    def __init__(self, bootstrap_servers, topic, model_path, influx_config, adj_path):
-        self.bootstrap_servers = bootstrap_servers
-        self.topic = topic
-        self.window_size = 12
-        self.data_buffer = deque(maxlen=self.window_size)
+    def __init__(self):
+        print("⚙️ Consumer başlatılıyor...")
+        self.device = torch.device("cpu")
         
-        # Resources
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = self._load_model(model_path)
+        # 1. Normalizer
+        if not os.path.exists(DATA_PATH):
+             print(f"❌ HATA: Veri dosyası bulunamadı: {DATA_PATH}")
+             sys.exit(1)
+        
+        print("📊 Veri seti yükleniyor...")
+        df_full = load_traffic_data(DATA_PATH)
         self.scaler = MinMaxNormalizer()
-        self.scaler._min = 0.0; self.scaler._max = 70.0 
+        self.scaler.fit(df_full.values)
         
-        # InfluxDB
-        self.influx_client = InfluxDBClient(**influx_config)
-        self.write_api = self.influx_client.write_api(write_options=SYNCHRONOUS)
-        self.bucket = "traffic_data"
-        self.sensor_order = None 
-
-        # Load Graph
-        adj = load_adjacency_matrix(adj_path)
-        if adj is None:
-            logger.warning(f"Adjacency matrix not found at {adj_path}! Using Identity (Low Accuracy).")
-            self.laplacian = torch.eye(207).to(self.device)
-        else:
-            logger.info(f"Loaded Adjacency Matrix from {adj_path}")
-            self.laplacian = torch.tensor(adj, dtype=torch.float32).to(self.device)
-
-    def _load_model(self, path):
-        model = ST_GCN_LSTM(num_nodes=207, in_channels=1, out_channels=1, lstm_units=64, K=2)
-        if not os.path.exists(path):
-            logger.error(f"Model not found at {path}")
+        # 2. Graf Yapısı
+        if not os.path.exists(ADJ_PATH):
+            print(f"❌ HATA: Adj dosyası bulunamadı: {ADJ_PATH}")
             sys.exit(1)
             
-        model.load_state_dict(torch.load(path, map_location=self.device))
-        model.to(self.device)
-        model.eval()
-        return model
+        print("🕸️ Graf yapısı yükleniyor...")
+        _, adj_mx = load_adj_matrix(ADJ_PATH)
+        self.laplacian = calculate_scaled_laplacian(adj_mx).to(self.device)
+        
+        # 3. Model
+        print(f"🧠 Model yükleniyor: {MODEL_PATH}")
+        if not os.path.exists(MODEL_PATH):
+            print(f"❌ HATA: Model dosyası yok! {MODEL_PATH}")
+            sys.exit(1)
 
-    async def start(self):
-        self.consumer = AIOKafkaConsumer(
-            self.topic,
-            bootstrap_servers=self.bootstrap_servers,
-            value_deserializer=lambda v: json.loads(v.decode('utf-8'))
-        )
-        await self.consumer.start()
-        logger.info(f"Subscribed to topic: {self.topic}")
-
-    async def stop(self):
-        await self.consumer.stop()
-        self.influx_client.close()
-
-    def _prepare_input(self, readings_dict):
-        if self.sensor_order is None:
-            self.sensor_order = sorted(readings_dict.keys())
-        vector = np.array([readings_dict[k] for k in self.sensor_order])
-        vector = self.scaler.transform(vector)
-        return vector.reshape(-1, 1)
-
-    async def run_inference_loop(self):
-        logger.info("Waiting for data stream...")
-        async for msg in self.consumer:
-            try:
-                data = msg.value 
-                timestamp = data['timestamp']
-                readings = data['sensor_readings']
-                
-                # --- NEW: Calculate Actual Global Average for Monitoring ---
-                real_vals = list(readings.values())
-                actual_val = sum(real_vals) / len(real_vals)
-                
-                input_vector = self._prepare_input(readings)
-                self.data_buffer.append(input_vector)
-
-                if len(self.data_buffer) == self.window_size:
-                    seq_np = np.array(self.data_buffer)
-                    input_tensor = torch.tensor(seq_np, dtype=torch.float32).unsqueeze(0).to(self.device)
-                    
-                    with torch.no_grad():
-                        prediction = self.model(input_tensor, self.laplacian)
-                        pred_val = self.scaler.inverse_transform(prediction.cpu().numpy())
-                        
-                        if pred_val.size == 1:
-                            # Scalar Prediction (Global Avg)
-                            pred_mph = pred_val.item()
-                            # Calculate Error
-                            mae_error = abs(pred_mph - actual_val)
-                            
-                            # Write Monitoring Data (Actual, Pred, Error)
-                            self._write_monitor_data(timestamp, actual_val, pred_mph, mae_error)
-                        else:
-                            # Batch Prediction (Per Sensor)
-                            self._write_batch_prediction(timestamp, pred_val.flatten())
-                            
-            except Exception as e:
-                logger.error(f"Inference Error: {e}")
-
-    def _write_monitor_data(self, timestamp, actual, predicted, error):
-        """
-        Writes comprehensive monitoring data to InfluxDB.
-        """
-        # Point 1: Actual
-        p1 = Point("traffic_monitor").tag("type", "actual").field("speed", float(actual)).time(timestamp)
-        # Point 2: Predicted
-        p2 = Point("traffic_monitor").tag("type", "predicted").field("speed", float(predicted)).time(timestamp)
-        # Point 3: Error
-        p3 = Point("traffic_monitor").tag("type", "error").field("mae", float(error)).time(timestamp)
-
+        num_nodes = df_full.shape[1]
+        self.model = STGCN_LSTM(num_nodes=num_nodes, in_features=1, hidden_dim=64, out_dim=1, K=3)
+        
         try:
-            self.write_api.write(bucket=self.bucket, record=[p1, p2, p3])
-            # Log nice summary to console
-            logger.info(f"Time: {timestamp} | Actual: {actual:.2f} | Pred: {predicted:.2f} | Diff: {error:.2f}")
+            self.model.load_state_dict(torch.load(MODEL_PATH, map_location=self.device))
+            print("✅ Model ağırlıkları yüklendi.")
         except Exception as e:
-             logger.warning(f"InfluxDB Write Failed: {e}")
+            print(f"❌ Model yükleme hatası: {e}")
+            sys.exit(1)
 
-    def _write_batch_prediction(self, timestamp, values):
-        points = []
-        for i, val in enumerate(values):
-            p = Point("traffic_prediction").tag("sensor_id", self.sensor_order[i]).field("speed", float(val)).time(timestamp)
-            points.append(p)
+        self.model.to(self.device)
+        self.model.eval()
+        
+        # 4. InfluxDB
+        print("💾 InfluxDB'ye bağlanılıyor...")
+        self.influx_client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
+        self.write_api = self.influx_client.write_api(write_options=SYNCHRONOUS)
+        
+        self.buffer = []
+        print("✅ Consumer kurulumu tamamlandı.")
+
+    def process_stream(self):
+        print("🎧 Kafka bağlantısı deneniyor...")
         try:
-            self.write_api.write(bucket=self.bucket, record=points)
-            logger.info(f"Wrote {len(points)} sensor predictions.")
+            consumer = KafkaConsumer(
+                KAFKA_TOPIC,
+                bootstrap_servers=BOOTSTRAP_SERVERS,
+                auto_offset_reset='latest',
+                enable_auto_commit=True,
+                group_id=KAFKA_GROUP,
+                value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+                consumer_timeout_ms=10000  # 10 saniye veri gelmezse hata verip çıkmasın diye
+            )
+            print("✅ Kafka'ya bağlanıldı. Mesaj bekleniyor...")
         except Exception as e:
-            logger.warning(f"InfluxDB Write Failed: {e}")
+            print(f"❌ Kafka Bağlantı Hatası: {e}")
+            print("👉 İPUCU: Docker çalışıyor mu? 'docker ps' komutunu dene.")
+            return
 
-async def main():
-    KAFKA = "localhost:9092"
-    TOPIC = "traffic_live_v1"
-    
-    # Absolute Paths
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    MODEL = os.path.abspath(os.path.join(BASE_DIR, '../../../models/gnn_model.pth'))
-    ADJ = os.path.abspath(os.path.join(src_dir, 'mobility/data/adj_METR-LA.pkl'))
-    
-    INFLUX = {"url": "http://localhost:8086", "token": "my-token", "org": "traffic_org"}
+        for message in consumer:
+            # Mesaj geldiğinde buraya girer
+            data = message.value
+            if 'sensor_readings' not in data:
+                continue
 
-    consumer = TrafficConsumer(KAFKA, TOPIC, MODEL, INFLUX, ADJ)
-    
-    await consumer.start()
-    try:
-        await consumer.run_inference_loop()
-    finally:
-        await consumer.stop()
+            sensor_readings = np.array(data['sensor_readings'])
+            
+            self.buffer.append(sensor_readings)
+            
+            if len(self.buffer) > SEQ_LEN:
+                self.buffer.pop(0)
+            
+            if len(self.buffer) == SEQ_LEN:
+                self.predict_and_store(current_actual=sensor_readings)
+            else:
+                # Buffer dolana kadar bilgi verelim
+                if len(self.buffer) % 5 == 0:
+                    print(f"⏳ Buffer doluyor: {len(self.buffer)}/{SEQ_LEN}")
+
+    def predict_and_store(self, current_actual):
+        try:
+            input_data = np.array(self.buffer)
+            input_norm = self.scaler.transform(input_data)
+            input_tensor = torch.FloatTensor(input_norm).unsqueeze(0).unsqueeze(-1).to(self.device)
+            
+            with torch.no_grad():
+                prediction_norm = self.model(input_tensor, self.laplacian)
+                
+            prediction_norm = prediction_norm.cpu().numpy().squeeze()
+            prediction_real = self.scaler.inverse_transform(prediction_norm)
+            
+            mae = np.mean(np.abs(prediction_real - current_actual))
+            
+            points = []
+            
+            # Tüm sensörleri kaydet
+            for node_idx in range(len(current_actual)):
+                p = Point("traffic_monitor") \
+                    .field("actual_speed", float(current_actual[node_idx])) \
+                    .field("predicted_speed", float(prediction_real[node_idx])) \
+                    .tag("sensor_id", f"sensor_{node_idx}")
+                points.append(p)
+
+            p_mae = Point("traffic_monitor") \
+                .field("network_mae", float(mae)) \
+                .tag("sensor_id", "global_network")
+            points.append(p_mae)
+                
+            self.write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=points)
+            logger.info(f"🔮 Global MAE: {mae:.2f} | Sensor_0 Act: {current_actual[0]:.2f} vs Pred: {prediction_real[0]:.2f}")
+            
+        except Exception as e:
+            print(f"❌ Tahmin/Yazma Hatası: {e}")
+            traceback.print_exc()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    print("🚀 Script Başlatıldı (Main Block)")
+    try:
+        consumer = TrafficConsumer()
+        consumer.process_stream()
+    except KeyboardInterrupt:
+        print("\n🛑 Kullanıcı tarafından durduruldu.")
+    except Exception as e:
+        print(f"\n❌ BEKLENMEYEN KRİTİK HATA:")
+        traceback.print_exc()

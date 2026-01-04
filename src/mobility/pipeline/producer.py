@@ -1,108 +1,89 @@
 import sys
 import os
-
-# --- PATH FIX START ---
-# This allows Python to find the 'mobility' package inside 'src'
-current_dir = os.path.dirname(os.path.abspath(__file__))
-# Go up 2 levels: 'pipeline' -> 'mobility' -> 'src'
-src_dir = os.path.abspath(os.path.join(current_dir, '../../'))
-sys.path.append(src_dir)
-# --- PATH FIX END ---
-
-import logging
-import asyncio
-import pandas as pd
+import time
 import json
-from datetime import datetime, timedelta  # <--- NEW IMPORT for live simulation
-from pathlib import Path
-from typing import Optional, Dict
-from aiokafka import AIOKafkaProducer
+import numpy as np
+import logging
+from kafka import KafkaProducer
+from datetime import datetime
 
-# Import your Pydantic model
-from mobility.schemas.validation import TrafficSnapshot
+# --- PATH AYARLAMALARI ---
+# mobility paketini bulabilmesi için
+current_dir = os.path.dirname(os.path.abspath(__file__))
+src_dir = os.path.dirname(os.path.dirname(current_dir))
+sys.path.append(src_dir)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+from mobility.preprocessing import load_traffic_data
 
-class TrafficProducer:
-    def __init__(self, bootstrap_servers: str, topic: str):
-        self.bootstrap_servers = bootstrap_servers
-        self.topic = topic
-        self.producer: Optional[AIOKafkaProducer] = None
+# Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("TrafficProducer")
 
-    async def start(self):
-        self.producer = AIOKafkaProducer(
-            bootstrap_servers=self.bootstrap_servers,
-            value_serializer=lambda v: json.dumps(v).encode('utf-8')
-        )
-        await self.producer.start()
-        logger.info("Kafka Producer started.")
+# KAFKA AYARLARI
+KAFKA_TOPIC = "traffic_sensor_data"
+KAFKA_BOOTSTRAP_SERVERS = 'localhost:9092'
 
-    async def stop(self):
-        if self.producer:
-            await self.producer.stop()
+def json_serializer(data):
+    return json.dumps(data).encode('utf-8')
 
-    async def stream_data(self, df: pd.DataFrame, interval: float = 0.5):
-        logger.info(f"Streaming {len(df)} time steps...")
-        
-        # 1. Get the current time as the starting point (RIGHT NOW)
-        current_base_time = datetime.utcnow()
-        
-        # Iterating by Time Step (Row)
-        # We enumerate to calculate the time offset
-        for i, (original_timestamp, row) in enumerate(df.iterrows()):
-            try:
-                # 2. Create a FAKE "Now" timestamp
-                # Each step adds 5 minutes to the current time to simulate a live feed
-                # So row 1 is Now, row 2 is Now + 5 mins, etc.
-                simulated_time = current_base_time + timedelta(seconds=10*i)
-
-                # 3. Convert row to dictionary {sensor_id: speed}
-                readings = {str(k): float(v) for k, v in row.to_dict().items()}
-                
-                # 4. Create Snapshot with SIMULATED live time
-                snapshot = TrafficSnapshot(
-                    timestamp=simulated_time.isoformat(),
-                    sensor_readings=readings
-                )
-                
-                # 5. Send message
-                await self.producer.send(
-                    self.topic, 
-                    snapshot.model_dump(mode='json')
-                )
-                
-                logger.info(f"Sent snapshot for {simulated_time}")
-                await asyncio.sleep(interval)
-                
-            except Exception as e:
-                logger.error(f"Error sending snapshot: {e}")
-
-async def main():
-    KAFKA_SERVER = "localhost:9092"
-    TOPIC = "traffic_live_v1"
-
-    # --- DATA PATH FIX ---
-    DATA_DIR = os.path.join(src_dir, 'mobility/data')
-    FILE_PATH = os.path.join(DATA_DIR, 'metr-la.h5')
-
-    if not os.path.exists(FILE_PATH):
-        logger.error(f"Data file not found at: {FILE_PATH}")
+def run_producer(data_path):
+    # 1. Veriyi Yükle
+    logger.info(f"⏳ Loading historical data from {data_path}...")
+    try:
+        df = load_traffic_data(data_path)
+    except Exception as e:
+        logger.error(f"Veri yüklenemedi: {e}")
         return
 
-    # Quick Load
-    logger.info(f"Loading data from {FILE_PATH}...")
-    df = pd.read_hdf(FILE_PATH)
+    # DataFrame'i Numpy array'e çevir
+    data_values = df.values
     
-    # Use first 2000 rows for demo
-    df = df.iloc[:2000]
+    logger.info(f"✅ Data loaded. Shape: {data_values.shape}. Starting stream...")
 
-    producer = TrafficProducer(KAFKA_SERVER, TOPIC)
-    await producer.start()
+    # 2. Kafka Producer Başlat
     try:
-        await producer.stream_data(df)
-    finally:
-        await producer.stop()
+        producer = KafkaProducer(
+            bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],
+            value_serializer=json_serializer
+        )
+    except Exception as e:
+        logger.error(f"Kafka'ya bağlanılamadı. Docker konteynerleri ayakta mı? Hata: {e}")
+        return
+
+    # 3. Veriyi Akıt (Streaming Loop)
+    for i, row in enumerate(data_values):
+        try:
+            # Veriyi hazırla
+            message = {
+                "timestamp": datetime.utcnow().isoformat(),
+                "step_index": i,
+                "sensor_readings": row.tolist() # Numpy array seri hale gelmez, listeye çevir
+            }
+            
+            # Kafka'ya gönder
+            producer.send(KAFKA_TOPIC, message)
+            
+            # Logla (Her 100 adımda bir veya ilk adımlarda)
+            if i % 100 == 0:
+                logger.info(f"📤 Sent Step {i}/{len(data_values)} | Sensor[0] Speed: {row[0]:.2f}")
+            
+            # Simülasyon Hızı: Gerçek hayatta 5 dk olan arayı burada 0.5 saniye yapıyoruz
+            time.sleep(0.5) 
+            
+        except KeyboardInterrupt:
+            logger.info("🛑 Producer stopped by user.")
+            break
+        except Exception as e:
+            logger.error(f"❌ Error sending message: {e}")
+
+    producer.close()
+    logger.info("🏁 Streaming finished.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Veri dosyasının yolu
+    data_file = os.path.join(src_dir, "mobility", "data", "metr-la.h5")
+    
+    if not os.path.exists(data_file):
+        logger.error(f"File not found: {data_file}")
+    else:
+        run_producer(data_file)
