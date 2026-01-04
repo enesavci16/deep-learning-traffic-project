@@ -24,6 +24,16 @@ class MinMaxNormalizer:
         if self._max - self._min == 0:
             return np.zeros_like(data)
         return (data - self._min) / (self._max - self._min)
+    
+    # --- EKLENEN KISIM ---
+    def fit_transform(self, data):
+        """
+        Fits the scaler to data, then transforms it.
+        Combines fit() and transform() calls.
+        """
+        self.fit(data)
+        return self.transform(data)
+    # ---------------------
 
     def inverse_transform(self, data):
         return data * (self._max - self._min) + self._min
@@ -50,8 +60,16 @@ def load_adjacency_matrix(file_path: str):
         return None
         
     with open(file_path, 'rb') as f:
-        sensor_ids, sensor_id_to_ind, adj_mx = pickle.load(f)
-    return adj_mx
+        # pickle.load list döner: [sensor_ids, sensor_id_to_ind, adj_mx]
+        # Biz sadece matrisi (3. eleman, index 2) istiyoruz ama
+        # bazen yapı farklı olabilir, kontrol edelim.
+        try:
+            data = pickle.load(f)
+            if isinstance(data, list) and len(data) == 3:
+                return data[2] # adj_mx
+            return data
+        except:
+            return None
 
 def create_sequences(data: np.ndarray, seq_len: int, horizon: int):
     """

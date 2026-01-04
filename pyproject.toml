@@ -14,6 +14,7 @@ dependencies = [
     "influxdb-client",
     "h5py",
     "tables>=3.10.1",
+    "scikit-learn>=1.7.2",
 ]
 
 [tool.uv]

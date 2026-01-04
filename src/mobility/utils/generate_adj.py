@@ -6,7 +6,7 @@ import sys
 
 # Standard way to compute graph structure from data if map is missing:
 # Calculate Pearson correlation between all sensor pairs.
-# If correlation > 0.5, draw an edge.
+# If correlation > 0.4, draw an edge.
 
 def generate_adjacency_matrix():
     # 1. Setup Paths
@@ -25,13 +25,25 @@ def generate_adjacency_matrix():
     df = pd.read_hdf(H5_PATH)
     data = df.values
     sensor_ids = df.columns.astype(str).tolist()
-    
-    print(f"Data Loaded. Shape: {data.shape} (Time x Sensors)")
+
+    print(f"Data Loaded. Shape: {data.shape}")
+
+    # --- DÜZELTME BAŞLANGICI (DATA LEAKAGE PREVENTION) ---
+    # Verinin sadece eğitim kısmını (ilk %70) alarak korelasyon hesaplıyoruz.
+    # Böylece model test setindeki (gelecekteki) trafik davranışlarını "önceden görmemiş" oluyor.
+    TRAIN_RATIO = 0.7 
+    num_train = int(data.shape[0] * TRAIN_RATIO)
+    train_data = data[:num_train, :]
+
+    print(f"Using only training data (first {num_train} steps) for graph generation to avoid Data Leakage.")
+    # --- DÜZELTME BİTİŞİ ---
+
     print("Calculating correlation matrix (this may take 1-2 minutes)...")
 
     # 3. Calculate Correlation
-    # We transpose to (Sensors x Time) so corrcoef works on sensors
-    corr_matrix = np.corrcoef(data.T)
+    # We transpose (.T) so corrcoef works on sensors (rows) instead of time steps
+    # corr_matrix shape: (num_sensors, num_sensors)
+    corr_matrix = np.corrcoef(train_data.T)
     
     # 4. Thresholding to create Adjacency
     # We only keep strong connections (> 0.4 correlation)
@@ -40,7 +52,8 @@ def generate_adjacency_matrix():
     adj_mx = np.zeros_like(corr_matrix)
     adj_mx[corr_matrix > threshold] = 1
     
-    # Remove self-loops (optional, but standard for some GCNs)
+    # Remove self-loops (diagonal = 0)
+    # Chebyshev Conv formula usually adds Identity matrix later or handles x term explicitly.
     np.fill_diagonal(adj_mx, 0)
     
     # 5. Save in the expected format: (sensor_ids, map, matrix)
@@ -49,6 +62,7 @@ def generate_adjacency_matrix():
     print(f"Graph generated! Found {np.sum(adj_mx)} connections.")
     
     with open(OUTPUT_PKL_PATH, 'wb') as f:
+        # Saving as a list to match standard METR-LA format
         pickle.dump([sensor_ids, sensor_id_to_ind, adj_mx], f)
         
     print(f"✅ Saved adjacency matrix to: {OUTPUT_PKL_PATH}")
